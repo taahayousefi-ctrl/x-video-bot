@@ -61,6 +61,41 @@ def get_quoted_tweet_url(tweet_id: str) -> str | None:
     return f"https://x.com/{author}/status/{quoted_id}"
 
 
+def download_video(url: str, tmp_dir: str) -> str | None:
+    """
+    ویدیو رو دانلود می‌کنه و مسیر فایل واقعی دانلودشده رو برمی‌گردونه.
+    اگه هیچ فایل ویدیویی دانلود نشه (مثلاً پست فقط عکس/متن بوده)، None برمی‌گردونه.
+    """
+    downloaded_files = []
+
+    def hook(d):
+        if d.get("status") == "finished" and d.get("filename"):
+            downloaded_files.append(d["filename"])
+
+    ydl_opts = {
+        "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "format": "best",
+        "postprocessors": [],
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "progress_hooks": [hook],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.extract_info(url, download=True)
+
+    video_extensions = (".mp4", ".mov", ".webm", ".mkv")
+    video_files = [
+        f for f in downloaded_files
+        if f.lower().endswith(video_extensions) and os.path.exists(f)
+    ]
+    if not video_files:
+        return None
+
+    return max(video_files, key=os.path.getsize)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "سلام! فقط کافیه لینک ویدیوی ایکس (X/Twitter) رو برام بفرستی تا دانلودش کنم و برات ارسال کنم."
@@ -84,43 +119,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        output_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
-        ydl_opts = {
-            "outtmpl": output_template,
-            "format": "best",
-            "postprocessors": [],
-            "quiet": True,
-            "no_warnings": True,
-        }
-
-        download_url = url
+        file_path = None
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(download_url, download=True)
-                file_path = ydl.prepare_filename(info)
+            file_path = download_video(url, tmp_dir)
         except Exception:
+            logger.exception("خطا در دانلود ویدیو")
+
+        if not file_path:
             id_match = TWEET_ID_PATTERN.search(url)
             quoted_url = get_quoted_tweet_url(id_match.group(1)) if id_match else None
 
-            if not quoted_url:
+            if quoted_url:
+                try:
+                    file_path = download_video(quoted_url, tmp_dir)
+                except Exception:
+                    logger.exception("خطا در دانلود ویدیوی توییت کوت‌شده")
+                    file_path = None
+
+            if not file_path:
                 await status_msg.edit_text(
-                    "ویدیویی توی این پست پیدا نشد (و توییت کوت‌شده‌ای هم نداره)."
+                    "ویدیویی توی این پست پیدا نشد (نه در خود پست، نه در توییت کوت‌شده احتمالی)."
                 )
                 return
-
-            download_url = quoted_url
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(download_url, download=True)
-                    file_path = ydl.prepare_filename(info)
-            except Exception as e:
-                logger.exception("خطا در دانلود ویدیوی توییت کوت‌شده")
-                await status_msg.edit_text(f"دانلود ویدیوی توییت کوت‌شده هم ناموفق بود:\n{e}")
-                return
-
-        if not os.path.exists(file_path):
-            await status_msg.edit_text("ویدیویی توی این پست پیدا نشد.")
-            return
 
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if file_size_mb > MAX_FILE_SIZE_MB:
