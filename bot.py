@@ -1,7 +1,9 @@
 import os
 import re
+import json
 import logging
 import tempfile
+import urllib.request
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -27,6 +29,36 @@ X_LINK_PATTERN = re.compile(
 )
 
 MAX_FILE_SIZE_MB = 50
+
+TWEET_ID_PATTERN = re.compile(r"status/(\d+)")
+
+
+def get_quoted_tweet_url(tweet_id: str) -> str | None:
+    """
+    اگه توییت داده‌شده یه کوت‌توییت باشه، لینک توییت اصلی (که ویدیو توشه) رو برمی‌گردونه.
+    از API غیررسمی syndication توییتر استفاده می‌کنه (همونی که برای embed کردن به کار می‌ره).
+    """
+    endpoint = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=a"
+    try:
+        req = urllib.request.Request(
+            endpoint, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        logger.exception("خطا در گرفتن اطلاعات توییت کوت‌شده")
+        return None
+
+    quoted = data.get("quoted_tweet")
+    if not quoted:
+        return None
+
+    quoted_id = quoted.get("id_str") or quoted.get("id")
+    author = (quoted.get("user") or {}).get("screen_name")
+    if not quoted_id or not author:
+        return None
+
+    return f"https://x.com/{author}/status/{quoted_id}"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -61,14 +93,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "no_warnings": True,
         }
 
+        download_url = url
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(download_url, download=True)
                 file_path = ydl.prepare_filename(info)
-        except Exception as e:
-            logger.exception("خطا در دانلود ویدیو")
-            await status_msg.edit_text(f"دانلود ویدیو ناموفق بود:\n{e}")
-            return
+        except Exception:
+            id_match = TWEET_ID_PATTERN.search(url)
+            quoted_url = get_quoted_tweet_url(id_match.group(1)) if id_match else None
+
+            if not quoted_url:
+                await status_msg.edit_text(
+                    "ویدیویی توی این پست پیدا نشد (و توییت کوت‌شده‌ای هم نداره)."
+                )
+                return
+
+            download_url = quoted_url
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(download_url, download=True)
+                    file_path = ydl.prepare_filename(info)
+            except Exception as e:
+                logger.exception("خطا در دانلود ویدیوی توییت کوت‌شده")
+                await status_msg.edit_text(f"دانلود ویدیوی توییت کوت‌شده هم ناموفق بود:\n{e}")
+                return
 
         if not os.path.exists(file_path):
             await status_msg.edit_text("ویدیویی توی این پست پیدا نشد.")
