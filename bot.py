@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -31,8 +33,30 @@ TWEET_ID_PATTERN = re.compile(r"status/(\d+)")
 
 def get_json(url: str) -> dict:
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(1 + attempt)
+    raise last_error
+
+
+def get_text(url: str) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(1 + attempt)
+    raise last_error
 
 
 def normalized(value: str) -> str:
@@ -96,9 +120,7 @@ def spotify_metadata(url: str) -> dict:
     # metadata contains the artist and remains usable without OAuth credentials.
     artist = data.get("author_name") or ""
     if not artist:
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=20) as response:
-            page = response.read().decode("utf-8", errors="replace")
+        page = get_text(url)
         match = re.search(r'<meta[^>]+(?:name|property)="(?:music:musician_description|description)"[^>]+content="([^"]+)"', page, re.I)
         if match:
             description = html.unescape(match.group(1))
@@ -113,11 +135,20 @@ def spotify_metadata(url: str) -> dict:
 
 def download_audio_file(audio_url: str, path: str) -> None:
     request = urllib.request.Request(audio_url, headers={"User-Agent": "spotify-telegram-bot/1.0"})
-    with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as output:
-        while chunk := response.read(1024 * 256):
-            output.write(chunk)
-            if output.tell() > MAX_FILE_SIZE_MB * 1024 * 1024:
-                raise ValueError("فایل صوتی بزرگ‌تر از سقف مجاز تلگرام است")
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as output:
+                while chunk := response.read(1024 * 256):
+                    output.write(chunk)
+                    if output.tell() > MAX_FILE_SIZE_MB * 1024 * 1024:
+                        raise ValueError("فایل صوتی بزرگ‌تر از سقف مجاز تلگرام است")
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(1 + attempt)
+    raise last_error
 
 
 def find_jamendo_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | None, str | None, str | None]:
@@ -195,9 +226,12 @@ def find_archive_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | Non
 
 def find_licensed_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | None, str | None, str | None]:
     for finder in (find_jamendo_audio, find_archive_audio):
-        path, license_url, source = finder(title, artist, tmp_dir)
-        if path:
-            return path, license_url, source
+        try:
+            path, license_url, source = finder(title, artist, tmp_dir)
+            if path:
+                return path, license_url, source
+        except Exception:
+            logger.warning("منبع صوتی %s موقتاً در دسترس نیست", finder.__name__, exc_info=True)
     return None, None, None
 
 
