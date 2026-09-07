@@ -1,3 +1,4 @@
+import asyncio
 import json
 import html
 import logging
@@ -58,6 +59,10 @@ def download_video(url: str, tmp_dir: str) -> str | None:
     ydl_opts = {
         "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
         "format": "best",
+        "socket_timeout": 15,
+        "retries": 2,
+        "fragment_retries": 2,
+        "concurrent_fragment_downloads": 4,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -137,15 +142,15 @@ async def handle_x(update: Update, url: str) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         file_path = None
         try:
-            file_path = download_video(url, tmp_dir)
+            file_path = await asyncio.to_thread(download_video, url, tmp_dir)
         except Exception:
             logger.exception("خطا در دانلود ویدیو")
         if not file_path:
             match = TWEET_ID_PATTERN.search(url)
-            quoted_url = get_quoted_tweet_url(match.group(1)) if match else None
+            quoted_url = await asyncio.to_thread(get_quoted_tweet_url, match.group(1)) if match else None
             if quoted_url:
                 try:
-                    file_path = download_video(quoted_url, tmp_dir)
+                    file_path = await asyncio.to_thread(download_video, quoted_url, tmp_dir)
                 except Exception:
                     logger.exception("خطا در دانلود ویدیوی توییت کوت‌شده")
         if not file_path:
@@ -167,7 +172,7 @@ async def handle_x(update: Update, url: str) -> None:
 async def handle_spotify(update: Update, url: str) -> None:
     status_msg = await update.message.reply_text("در حال بررسی لینک Spotify و پیدا کردن نسخه‌ی مجاز... ⏳")
     try:
-        metadata = spotify_metadata(url)
+        metadata = await asyncio.to_thread(spotify_metadata, url)
         title, artist = metadata["title"], metadata["artist"]
     except Exception:
         logger.exception("خطا در خواندن اطلاعات Spotify")
@@ -176,7 +181,9 @@ async def handle_spotify(update: Update, url: str) -> None:
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         try:
-            file_path, license_url = find_licensed_audio(title, artist, tmp_dir)
+            file_path, license_url = await asyncio.to_thread(
+                find_licensed_audio, title, artist, tmp_dir
+            )
         except Exception as error:
             logger.exception("خطا در جست‌وجوی منبع صوتی مجاز")
             await status_msg.edit_text(f"جست‌وجوی فایل صوتی ناموفق بود:\n{error}")
