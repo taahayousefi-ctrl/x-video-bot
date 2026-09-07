@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import html
 import logging
@@ -32,6 +33,18 @@ def get_json(url: str) -> dict:
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def normalized(value: str) -> str:
+    return re.sub(r"[^a-z0-9آ-ی]+", " ", (value or "").lower()).strip()
+
+
+def match_score(title: str, artist: str, candidate_title: str, candidate_artist: str) -> float:
+    wanted_title, wanted_artist = normalized(title), normalized(artist)
+    got_title, got_artist = normalized(candidate_title), normalized(candidate_artist)
+    title_score = difflib.SequenceMatcher(None, wanted_title, got_title).ratio()
+    artist_score = difflib.SequenceMatcher(None, wanted_artist, got_artist).ratio() if wanted_artist else 0
+    return title_score * 0.7 + artist_score * 0.3
 
 
 def get_quoted_tweet_url(tweet_id: str) -> str | None:
@@ -98,10 +111,19 @@ def spotify_metadata(url: str) -> dict:
     }
 
 
-def find_licensed_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | None, str | None]:
-    """Search Jamendo's licensed catalog. Requires a Jamendo client ID."""
+def download_audio_file(audio_url: str, path: str) -> None:
+    request = urllib.request.Request(audio_url, headers={"User-Agent": "spotify-telegram-bot/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as output:
+        while chunk := response.read(1024 * 256):
+            output.write(chunk)
+            if output.tell() > MAX_FILE_SIZE_MB * 1024 * 1024:
+                raise ValueError("فایل صوتی بزرگ‌تر از سقف مجاز تلگرام است")
+
+
+def find_jamendo_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | None, str | None, str | None]:
+    """Search Jamendo and accept only a close title/artist match with a license."""
     if not JAMENDO_CLIENT_ID:
-        return None, None
+        return None, None, None
     query = urllib.parse.urlencode(
         {
             "client_id": JAMENDO_CLIENT_ID,
@@ -112,21 +134,71 @@ def find_licensed_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | No
         }
     )
     data = get_json(f"https://api.jamendo.com/v3.0/tracks/?{query}")
-    for track in data.get("results", []):
+    candidates = sorted(
+        data.get("results", []),
+        key=lambda track: match_score(title, artist, track.get("name", ""), track.get("artist_name", "")),
+        reverse=True,
+    )
+    for track in candidates[:3]:
         audio_url = track.get("audiodownload") or track.get("audio")
         # Jamendo supplies the license URL; only accept tracks with an explicit license.
-        if not audio_url or not track.get("license_ccurl"):
+        score = match_score(title, artist, track.get("name", ""), track.get("artist_name", ""))
+        if not audio_url or not track.get("license_ccurl") or score < 0.72:
             continue
         safe_name = re.sub(r"[^\w.-]+", "_", f"{artist}-{title}", flags=re.UNICODE).strip("_")
         path = os.path.join(tmp_dir, f"{safe_name or 'spotify-track'}.mp3")
-        request = urllib.request.Request(audio_url, headers={"User-Agent": "spotify-telegram-bot/1.0"})
-        with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as output:
-            while chunk := response.read(1024 * 256):
-                output.write(chunk)
-                if output.tell() > MAX_FILE_SIZE_MB * 1024 * 1024:
-                    raise ValueError("فایل صوتی بزرگ‌تر از سقف مجاز تلگرام است")
-        return path, track.get("license_ccurl")
-    return None, None
+        download_audio_file(audio_url, path)
+        return path, track.get("license_ccurl"), "Jamendo"
+    return None, None, None
+
+
+def find_archive_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | None, str | None, str | None]:
+    """Search Internet Archive audio items with explicit Creative Commons/public-domain rights."""
+    query = urllib.parse.quote(
+        f'mediatype:audio AND (title:"{title}" OR creator:"{artist}")', safe=""
+    )
+    search_url = (
+        "https://archive.org/advancedsearch.php?q=" + query
+        + "&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=licenseurl&output=json&rows=15"
+    )
+    data = get_json(search_url)
+    docs = data.get("response", {}).get("docs", [])
+    candidates = []
+    for doc in docs:
+        license_url = doc.get("licenseurl") or ""
+        if not ("creativecommons.org" in license_url or "publicdomain" in license_url.lower()):
+            continue
+        creator = doc.get("creator", "")
+        creator = creator[0] if isinstance(creator, list) else creator
+        score = match_score(title, artist, doc.get("title", ""), creator)
+        candidates.append((score, doc, license_url))
+    for score, doc, license_url in sorted(candidates, reverse=True, key=lambda item: item[0]):
+        if score < 0.72:
+            continue
+        metadata = get_json("https://archive.org/metadata/" + urllib.parse.quote(doc["identifier"], safe=""))
+        files = metadata.get("files", [])
+        audio = next(
+            (item for item in files if str(item.get("name", "")).lower().endswith((".mp3", ".ogg", ".wav", ".flac"))),
+            None,
+        )
+        if not audio:
+            continue
+        name = os.path.basename(audio["name"])
+        path = os.path.join(tmp_dir, re.sub(r"[^\w.-]+", "_", name))
+        download_audio_file(
+            "https://archive.org/download/" + urllib.parse.quote(doc["identifier"], safe="") + "/" + urllib.parse.quote(audio["name"], safe="/"),
+            path,
+        )
+        return path, license_url, "Internet Archive"
+    return None, None, None
+
+
+def find_licensed_audio(title: str, artist: str, tmp_dir: str) -> tuple[str | None, str | None, str | None]:
+    for finder in (find_jamendo_audio, find_archive_audio):
+        path, license_url, source = finder(title, artist, tmp_dir)
+        if path:
+            return path, license_url, source
+    return None, None, None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -170,7 +242,7 @@ async def handle_x(update: Update, url: str) -> None:
 
 
 async def handle_spotify(update: Update, url: str) -> None:
-    status_msg = await update.message.reply_text("در حال بررسی لینک Spotify و پیدا کردن نسخه‌ی مجاز... ⏳")
+    status_msg = await update.message.reply_text("در حال بررسی چند منبع مجاز صوتی... ⏳")
     try:
         metadata = await asyncio.to_thread(spotify_metadata, url)
         title, artist = metadata["title"], metadata["artist"]
@@ -181,7 +253,7 @@ async def handle_spotify(update: Update, url: str) -> None:
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         try:
-            file_path, license_url = await asyncio.to_thread(
+            file_path, license_url, source = await asyncio.to_thread(
                 find_licensed_audio, title, artist, tmp_dir
             )
         except Exception as error:
@@ -192,7 +264,7 @@ async def handle_spotify(update: Update, url: str) -> None:
             if not JAMENDO_CLIENT_ID:
                 reason = "برای فعال‌سازی جست‌وجوی فایل‌های مجاز، متغیر JAMENDO_CLIENT_ID روی سرور تنظیم نشده است."
             else:
-                reason = "نسخه‌ی مجاز و قابل‌دانلود این آهنگ در کاتالوگ موجود پیدا نشد."
+                reason = "نسخه‌ی مجاز و قابل‌دانلود این آهنگ در Jamendo یا Internet Archive پیدا نشد."
             await status_msg.edit_text(
                 f"🎵 {title}\n👤 {artist}\n\n{reason}\n\n🔗 پخش رسمی: {metadata['spotify_url']}"
             )
@@ -204,7 +276,7 @@ async def handle_spotify(update: Update, url: str) -> None:
                     audio=audio_file,
                     title=title[:64] or "Spotify track",
                     performer=artist[:64] or None,
-                    caption=f"منبع مجاز: {license_url}",
+                    caption=f"منبع: {source}\nمجوز: {license_url}",
                 )
             await status_msg.delete()
         except Exception as error:
